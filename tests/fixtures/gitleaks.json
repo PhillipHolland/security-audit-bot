@@ -1,0 +1,19 @@
+[
+  {
+    "RuleID": "aws-access-key",
+    "Description": "found AKIAFAKEFAKEFAKEFAKE in config",
+    "File": "config.py",
+    "StartLine": 4,
+    "Secret": "AKIAFAKEFAKEFAKEFAKE",
+    "Match": "aws_key = \"AKIAFAKEFAKEFAKEFAKE\"",
+    "Fingerprint": "config.py:aws-access-key:4"
+  },
+  {
+    "RuleID": "aws-access-key",
+    "Description": "AWS key again",
+    "File": "config.py",
+    "StartLine": 4,
+    "Secret": "AKIAFAKEFAKEFAKEFAKE",
+    "Match": "aws_key = \"AKIAFAKEFAKEFAKEFAKE\""
+  }
+]

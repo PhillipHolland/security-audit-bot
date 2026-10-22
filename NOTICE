@@ -1,0 +1,44 @@
+Security Audit Bot
+Copyright (c) 2026 the Security Audit Bot maintainers
+
+This project does not vendor third-party source. `scripts/sab.py setup` clones
+or installs the components below into the user's home directory.
+
+Cloudflare security-audit skill
+https://github.com/cloudflare/security-audit-skill
+Pinned commit: c1c8a8c1471069fb0e188eeaff69b8e8db6564a8
+Path in that repo: skills/security-audit
+License: MIT
+Copyright (c) 2025-2026 Cloudflare, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Scanners (installed on demand, not shipped here):
+
+- Semgrep Community Edition engine: LGPL-2.1.
+  Registry packs p/security-audit, p/owasp-top-ten, and p/secrets are fetched
+  at scan time and are under the Semgrep Rules License v1.0, not LGPL.
+- gitleaks: MIT
+- osv-scanner: Apache-2.0
+- trivy: Apache-2.0
+- zizmor: MIT
+- bandit: Apache-2.0
+- pip-audit: Apache-2.0
+- npm (for npm audit): Artistic License 2.0
+- checkov: Apache-2.0

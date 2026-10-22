@@ -1,0 +1,49 @@
+{
+  "results": [
+    {
+      "source": {"path": "/repo/requirements.txt", "type": "lockfile"},
+      "packages": [
+        {
+          "package": {"name": "left-pad-demo", "version": "1.0.0", "ecosystem": "PyPI"},
+          "vulnerabilities": [
+            {
+              "id": "GHSA-fake-0001",
+              "summary": "demo issue in a fictional package",
+              "severity": [{"type": "CVSS_V3", "score": "7.8"}]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source": {"path": "/repo/requirements.txt", "type": "lockfile"},
+      "packages": [
+        {
+          "package": {"name": "left-pad-demo", "version": "1.0.0", "ecosystem": "PyPI"},
+          "vulnerabilities": [
+            {
+              "id": "GHSA-fake-0001",
+              "summary": "same demo issue, lower copy",
+              "database_specific": {"severity": "LOW"}
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source": {"path": "/repo/requirements.txt", "type": "lockfile"},
+      "packages": [
+        {
+          "package": {"name": "demo-util", "version": "0.1.0", "ecosystem": "PyPI"},
+          "vulnerabilities": [
+            {
+              "id": "GHSA-fake-0002",
+              "summary": "minor demo issue",
+              "database_specific": {"severity": "LOW"}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
