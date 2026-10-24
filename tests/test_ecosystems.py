@@ -41,6 +41,7 @@ class EcosystemTests(unittest.TestCase):
             self.assertEqual(
                 tools,
                 [
+                    "sab-checks",
                     "semgrep",
                     "gitleaks",
                     "osv-scanner",
@@ -58,7 +59,7 @@ class EcosystemTests(unittest.TestCase):
             root = Path(tmp)
             (root / "README.md").write_text("demo\n", encoding="utf-8")
             self.assertEqual(sab.detect_ecosystems(root), [])
-            self.assertEqual(sab.applicable_scanners([]), ["semgrep", "gitleaks", "trivy"])
+            self.assertEqual(sab.applicable_scanners([]), ["sab-checks", "semgrep", "gitleaks", "trivy"])
 
     def test_refuses_home_and_root(self):
         with self.assertRaises(ValueError):
