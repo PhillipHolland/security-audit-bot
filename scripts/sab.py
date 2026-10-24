@@ -2185,7 +2185,7 @@ def classify_env_var(name):
         return "public"
     for group, pattern in ENV_GROUPS:
         if pattern.search(name):
-            if group == "database" and re.search(r"(?:_|^)(?:NAME|PORT|HOST|USER|SSL|POOL|SCHEMA|TIMEOUT)$", name):
+            if group == "database" and re.search(r"^PG(?:HOST|PORT|USER|DATABASE|SSLMODE)$|(?:_|^)(?:NAME|PORT|HOST|USER|SSL|SSLMODE|POOL|SCHEMA|TIMEOUT)$", name):
                 return "config"
             return group
     return "config"
