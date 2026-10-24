@@ -26,7 +26,7 @@ class NormalizeDedupeTests(unittest.TestCase):
         self.assertEqual(shell["file"], "app.py")
         self.assertEqual(shell["severity"], "medium")
         for lead in leads:
-            self.assertEqual(set(lead), set(sab.LEAD_KEYS))
+            self.assertEqual(set(sab.public_lead(lead)), set(sab.LEAD_KEYS))
 
     def test_gitleaks_redacts_and_dedupes(self):
         leads = sab.dedupe_leads(sab.normalize_gitleaks(self.load("gitleaks.json"), Path("/repo")))

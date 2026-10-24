@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 import zipfile
 from collections import Counter
@@ -26,7 +27,8 @@ VERSION = "0.2.0"
 SKILL_REPO = "https://github.com/cloudflare/security-audit-skill"
 SKILL_COMMIT = "c1c8a8c1471069fb0e188eeaff69b8e8db6564a8"
 PER_TOOL_CAP = 100
-LEAD_KEYS = ("tool", "rule", "severity", "file", "line", "message", "fingerprint")
+LEAD_KEYS = ("tool", "rule", "severity", "file", "line", "message", "fingerprint", "kind", "also_reported_by")
+BASELINE_VERSION = 1
 
 SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 _SEVERITY_MAP = {
@@ -175,8 +177,10 @@ def which(name):
     return shutil.which(name)
 
 
-def scanner_env(home):
+def scanner_env(home, cache=None):
     # Isolated HOME so a scanner cannot read host credentials or cloud config.
+    # The cache (vulnerability databases, rule downloads) is shared across runs so
+    # each preflight does not re-download it. It never holds target code.
     skip = {"HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"}
     env = {key: os.environ[key] for key in ENV_KEEP if key in os.environ and key not in skip}
     env.setdefault("PATH", os.environ.get("PATH", "/usr/bin:/bin"))
@@ -185,7 +189,7 @@ def scanner_env(home):
         env["PATH"] = local + os.pathsep + env["PATH"]
     home = Path(home)
     env["HOME"] = str(home)
-    env["XDG_CACHE_HOME"] = str(home / "cache")
+    env["XDG_CACHE_HOME"] = str(Path(cache) if cache else home / "cache")
     env["XDG_CONFIG_HOME"] = str(home / "config")
     env["SEMGREP_SEND_METRICS"] = "off"
     env["SEMGREP_VERSION_CHECK"] = "0"
@@ -307,6 +311,8 @@ def make_lead(tool, rule, severity, file, line, message, fingerprint, secrets=No
         "line": as_line(line),
         "message": msg,
         "fingerprint": fp,
+        "kind": "code",
+        "also_reported_by": [],
     }
     return {key: lead[key] for key in LEAD_KEYS}
 
@@ -348,6 +354,79 @@ def extract_secrets(text):
         if _entropy_token(token):
             found.append(token)
     return found
+
+
+def tag_lead(lead, kind, package=None, ids=None):
+    """Attach private merge metadata. Stripped before anything is written."""
+    meta = {"kind": kind}
+    if kind == "dep":
+        meta["package"] = str(package or "").lower()
+        meta["ids"] = sorted({str(item) for item in (ids or []) if item})
+    lead["_meta"] = meta
+    lead["kind"] = kind
+    return lead
+
+
+def lead_kind(lead):
+    meta = lead.get("_meta") or {}
+    kind = meta.get("kind") or lead.get("kind")
+    if kind:
+        return kind
+    return "secret" if lead.get("tool") == "gitleaks" else "code"
+
+
+def stable_key(lead):
+    """Line-insensitive identity for baselines and run-to-run comparison.
+
+    Secrets keep the line so accepting one never hides a new secret in the same file.
+    """
+    if lead_kind(lead) == "secret":
+        parts = ("secret", lead.get("file"), lead.get("line"), lead.get("rule"))
+    else:
+        parts = (lead.get("tool"), lead.get("rule"), lead.get("file"), lead.get("message"))
+    return fingerprint_for(*parts)
+
+
+def merge_cross_tool(leads):
+    """Fold the same dependency advisory or the same secret reported by several tools into one lead."""
+    merged = []
+    for lead in leads:
+        meta = lead.get("_meta") or {}
+        kind = meta.get("kind")
+        target = None
+        if kind in ("dep", "secret"):
+            for prev in merged:
+                pmeta = prev.get("_meta") or {}
+                if pmeta.get("kind") != kind or prev["file"] != lead["file"]:
+                    continue
+                if lead["tool"] == prev["tool"] or lead["tool"] in prev["also_reported_by"]:
+                    continue
+                if kind == "dep" and (pmeta.get("package") != meta.get("package") or not set(pmeta.get("ids") or []) & set(meta.get("ids") or [])):
+                    continue
+                if kind == "secret" and prev["line"] != lead["line"]:
+                    continue
+                target = prev
+                break
+        if target is None:
+            lead.setdefault("also_reported_by", [])
+            merged.append(lead)
+            continue
+        target["also_reported_by"] = sorted(set(target["also_reported_by"]) | {lead["tool"]})
+        if SEVERITY_RANK[lead["severity"]] < SEVERITY_RANK[target["severity"]]:
+            target["severity"] = lead["severity"]
+        if kind == "dep":
+            target["_meta"]["ids"] = sorted(set(target["_meta"]["ids"]) | set(meta.get("ids") or []))
+    return merged
+
+
+def public_lead(lead):
+    out = {key: lead[key] for key in LEAD_KEYS if key in lead}
+    out.setdefault("also_reported_by", [])
+    out["kind"] = lead_kind(lead)
+    for key in ("change",):
+        if key in lead:
+            out[key] = lead[key]
+    return out
 
 
 def dedupe_leads(leads):
@@ -409,8 +488,9 @@ def normalize_semgrep(payload, root):
         extra = item.get("extra") or {}
         start = item.get("start") or {}
         message = extra.get("message") or item.get("check_id") or "semgrep"
+        rule_id = str(item.get("check_id") or "")
         leads.append(
-            make_lead(
+            tag_lead(make_lead(
                 "semgrep",
                 item.get("check_id") or "semgrep",
                 extra.get("severity"),
@@ -424,7 +504,7 @@ def normalize_semgrep(payload, root):
                     start.get("line"),
                     message,
                 ),
-            )
+            ), "secret" if ".secrets." in rule_id else "code")
         )
     return leads
 
@@ -444,7 +524,7 @@ def normalize_gitleaks(payload, root):
         line = item.get("StartLine") or item.get("startLine") or item.get("line")
         message = item.get("Description") or item.get("description") or rule
         leads.append(
-            make_lead(
+            tag_lead(make_lead(
                 "gitleaks",
                 rule,
                 "high",
@@ -453,7 +533,7 @@ def normalize_gitleaks(payload, root):
                 message,
                 fingerprint_for("gitleaks", rule, path, line, secret or match or message),
                 secrets=[secret, match],
-            )
+            ), "secret")
         )
     return leads
 
@@ -519,8 +599,11 @@ def normalize_osv(payload, root):
                 vuln = vulns.get(vid, {"id": vid, "summary": ""})
                 summary = vuln.get("summary") or vuln.get("details") or vid
                 label = f"{name}@{version}: {summary}" if version else f"{name}: {summary}"
+                aliases = list(ids)
+                for vid_alias in ids:
+                    aliases.extend((vulns.get(vid_alias) or {}).get("aliases") or [])
                 leads.append(
-                    make_lead(
+                    tag_lead(make_lead(
                         "osv-scanner",
                         vid,
                         _osv_severity(vuln),
@@ -528,7 +611,7 @@ def normalize_osv(payload, root):
                         1,
                         label,
                         fingerprint_for("osv-scanner", vid, file, name, version),
-                    )
+                    ), "dep", name, aliases)
                 )
     return leads
 
@@ -553,7 +636,7 @@ def normalize_trivy(payload, root):
             ver = vuln.get("InstalledVersion") or ""
             title = vuln.get("Title") or vid
             leads.append(
-                make_lead(
+                tag_lead(make_lead(
                     "trivy",
                     vid,
                     vuln.get("Severity"),
@@ -561,7 +644,7 @@ def normalize_trivy(payload, root):
                     1,
                     f"{pkg}@{ver}: {title}" if ver else f"{pkg}: {title}",
                     fingerprint_for("trivy", vid, file, pkg, ver),
-                )
+                ), "dep", pkg, [vid, *(vuln.get("VendorIDs") or [])])
             )
         for misconfig in block.get("Misconfigurations") or []:
             if not isinstance(misconfig, dict):
@@ -585,7 +668,7 @@ def normalize_trivy(payload, root):
             raw = secret.get("Match") or secret.get("Secret") or ""
             line = secret.get("StartLine") or 1
             leads.append(
-                make_lead(
+                tag_lead(make_lead(
                     "trivy",
                     secret.get("RuleID") or secret.get("RuleId") or "secret",
                     secret.get("Severity") or "high",
@@ -594,7 +677,7 @@ def normalize_trivy(payload, root):
                     secret.get("Title") or secret.get("RuleID") or "secret",
                     fingerprint_for("trivy-secret", secret.get("RuleID"), file, line, raw),
                     secrets=[raw, secret.get("Match") or "", secret.get("Secret") or ""],
-                )
+                ), "secret")
             )
     return leads
 
@@ -686,8 +769,9 @@ def normalize_npm_audit(payload, root, lockfile):
                 elif isinstance(via, str) and not title:
                     title = via
             rule = f"npm:{name}" + (f":{source}" if source and source != name else "")
+            ghsa = re.findall(r"GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}", json.dumps(info.get("via") or []))
             leads.append(
-                make_lead(
+                tag_lead(make_lead(
                     "npm-audit",
                     rule[:200],
                     info.get("severity"),
@@ -695,7 +779,7 @@ def normalize_npm_audit(payload, root, lockfile):
                     1,
                     f"{name}: {title}" if title else str(name),
                     fingerprint_for("npm-audit", rule, file, name),
-                )
+                ), "dep", name, ghsa)
             )
     advisories = payload.get("advisories")
     if isinstance(advisories, dict):
@@ -735,7 +819,7 @@ def normalize_pip_audit(payload, root, req_file):
                 continue
             vid = vuln.get("id") or "vuln"
             leads.append(
-                make_lead(
+                tag_lead(make_lead(
                     "pip-audit",
                     vid,
                     "medium",
@@ -743,7 +827,7 @@ def normalize_pip_audit(payload, root, req_file):
                     1,
                     f"{name}@{version}: {vuln.get('description') or vid}" if version else f"{name}: {vid}",
                     fingerprint_for("pip-audit", vid, file, name, version),
-                )
+                ), "dep", name, [vid, *(vuln.get("aliases") or [])])
             )
     return leads
 
@@ -895,9 +979,27 @@ def assert_safe_repo(path):
     return resolved
 
 
-def _note_from_result(result):
-    text = (result.stderr or result.stdout or "").strip().splitlines()
-    return clean_message(text[0] if text else f"exit {result.returncode}")
+_NOTE_HINT = re.compile(r"(?i)\b(error|fatal|failed|failure|not found|no package|unable|denied|invalid|timed out)\b")
+
+
+def scrub_paths(text, root=None):
+    """Replace absolute local paths so notes never carry the host layout."""
+    if not text:
+        return ""
+    if root:
+        text = text.replace(str(root), "<target>")
+    home = str(Path.home())
+    if home and home != "/":
+        text = text.replace(home, "~")
+    return re.sub(r"(?<![\w<~])/(?:home|Users|tmp|var/folders|private)/[^\s'\"]+", "<path>", text)
+
+
+def _note_from_result(result, root=None):
+    lines = [line.strip() for line in (result.stderr or result.stdout or "").splitlines() if line.strip()]
+    if not lines:
+        return f"exit {result.returncode}"
+    hinted = [line for line in lines if _NOTE_HINT.search(line)]
+    return clean_message(scrub_paths((hinted or lines)[-1 if not hinted else 0], root))
 
 
 def _run_json_command(argv, timeout, cwd, runner, env):
@@ -906,7 +1008,7 @@ def _run_json_command(argv, timeout, cwd, runner, env):
     if payload is None and result.returncode == 124:
         return None, "timed out"
     if payload is None:
-        return None, _note_from_result(result) or f"exit {result.returncode}"
+        return None, _note_from_result(result, cwd) or f"exit {result.returncode}"
     note = "" if result.returncode in (0, 1) else f"exit {result.returncode}"
     return payload, note
 
@@ -982,6 +1084,8 @@ def execute_scanner(name, root, runner, which_fn, env):
             payload, note = _run_json_command(argv, TIMEOUTS[name], str(root), runner, env)
             if payload is not None:
                 return normalize_osv(payload, root), note
+            if "no package sources" in (note or "").lower():
+                return [], "no lockfile or manifest osv-scanner can read"
             last = note or last
         return [], last
 
@@ -990,6 +1094,8 @@ def execute_scanner(name, root, runner, which_fn, env):
         if not binary:
             return [], "not installed"
         common = [binary, "fs", "--format", "json", "--quiet", "--skip-version-check"]
+        if env.get("XDG_CACHE_HOME"):
+            common += ["--cache-dir", str(Path(env["XDG_CACHE_HOME"]) / "trivy")]
         attempts = [
             (common + ["--scanners", "vuln,misconfig,secret", str(root)], ""),
             (common + ["--offline-scan", "--skip-db-update", "--scanners", "vuln,misconfig,secret", str(root)], "offline scan"),
@@ -1091,7 +1197,112 @@ def execute_scanner(name, root, runner, which_fn, env):
     return [], "unknown scanner"
 
 
-def render_summary(target_name, ecosystems, tool_rows, leads, truncated):
+SOURCE_SUFFIXES = {
+    ".py", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".go", ".rs", ".rb", ".java", ".kt",
+    ".php", ".cs", ".c", ".cc", ".cpp", ".h", ".hpp", ".swift", ".scala", ".sh", ".tf", ".sql",
+    ".vue", ".svelte", ".html",
+}
+
+
+def size_profile(root):
+    """Rough size of the tree. Used to tell the owner what a full audit is likely to cost."""
+    files = source_files = source_lines = 0
+    for path in iter_files(root):
+        files += 1
+        if path.suffix.lower() not in SOURCE_SUFFIXES or path.is_symlink():
+            continue
+        source_files += 1
+        try:
+            with open(path, "rb") as handle:
+                source_lines += handle.read(2 * 1024 * 1024).count(b"\n")
+        except OSError:
+            continue
+    if source_lines < 5000:
+        size_class = "small"
+    elif source_lines < 50000:
+        size_class = "medium"
+    else:
+        size_class = "large"
+    return {"files": files, "source_files": source_files, "source_lines": source_lines, "class": size_class}
+
+
+SIZE_ADVICE = {
+    "small": "A full audit is the lighter end: one recon pass and a few hunters.",
+    "medium": "A full audit is substantial: expect many hunters and a long run.",
+    "large": "A full audit is heavy. Consider scoping to the riskiest directories first, or start with quick triage.",
+}
+
+
+def load_baseline(path):
+    if not path:
+        return {"version": BASELINE_VERSION, "entries": []}
+    source = Path(path)
+    if not source.exists():
+        return {"version": BASELINE_VERSION, "entries": []}
+    data = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+        raise ValueError(f"{source.name} is not a baseline file")
+    return data
+
+
+def apply_baseline(leads, baseline):
+    """Split leads into (kept, suppressed, stale entries). Entries match on stable key or fingerprint."""
+    entries = [entry for entry in baseline.get("entries") or [] if isinstance(entry, dict)]
+    by_key = {entry.get("key"): entry for entry in entries if entry.get("key")}
+    by_fp = {entry.get("fingerprint"): entry for entry in entries if entry.get("fingerprint")}
+    kept, suppressed, used = [], [], set()
+    for lead in leads:
+        entry = by_key.get(stable_key(lead)) or by_fp.get(lead["fingerprint"])
+        if entry is None:
+            kept.append(lead)
+            continue
+        used.add(id(entry))
+        item = dict(lead)
+        item["accepted_reason"] = entry.get("reason", "")
+        item["accepted_at"] = entry.get("accepted_at", "")
+        suppressed.append(item)
+    stale = [entry for entry in entries if id(entry) not in used]
+    return kept, suppressed, stale
+
+
+def compare_with_previous(leads, previous_doc, tool_rows):
+    """Mark leads new or unchanged and list previous leads that are gone.
+
+    A previous lead only counts as resolved when its tool ran cleanly this time and was not capped.
+    """
+    previous = [lead for lead in (previous_doc.get("leads") or []) if isinstance(lead, dict)]
+    previous += [lead for lead in (previous_doc.get("suppressed") or []) if isinstance(lead, dict)]
+    prev_keys = {stable_key(lead) for lead in previous}
+    current_keys = set()
+    for lead in leads:
+        key = stable_key(lead)
+        current_keys.add(key)
+        lead["change"] = "unchanged" if key in prev_keys else "new"
+    reliable = {
+        row["tool"] for row in tool_rows
+        if row["status"] == "ok" and "capped" not in (row.get("note") or "")
+    }
+    resolved, unverified = [], []
+    for lead in previous:
+        if stable_key(lead) in current_keys:
+            continue
+        tools = {lead.get("tool"), *(lead.get("also_reported_by") or [])}
+        public = {key: lead.get(key) for key in ("tool", "rule", "severity", "file", "line", "message", "fingerprint")}
+        (resolved if tools & reliable else unverified).append(public)
+    return resolved, unverified
+
+
+def _lead_line(lead):
+    also = f" (also {', '.join(lead['also_reported_by'])})" if lead.get("also_reported_by") else ""
+    change = f" [{lead['change']}]" if lead.get("change") else ""
+    return (
+        f"- {lead['severity']}{change} `{lead['tool']}`{also} {lead['file']}:{lead['line']} "
+        f"{lead['rule']} — {lead['message']} ({lead['fingerprint'][7:19]})"
+    )
+
+
+def render_summary(target_name, ecosystems, tool_rows, leads, truncated, size=None,
+                   suppressed=None, stale=None, comparison=None):
     lines = [
         "# Preflight summary",
         "",
@@ -1103,72 +1314,137 @@ def render_summary(target_name, ecosystems, tool_rows, leads, truncated):
         "",
     ]
     lines.append(", ".join(ecosystems) if ecosystems else "(none detected)")
-    lines.extend(["", "## Tools", "", "| Tool | Status | Leads | Note |", "| --- | --- | --- | --- |"])
+    if size:
+        lines.extend([
+            "",
+            "## Size",
+            "",
+            f"{size['source_files']} source files, about {size['source_lines']} lines ({size['files']} files in all). "
+            f"Class: {size['class']}. {SIZE_ADVICE[size['class']]}",
+        ])
+    lines.extend(["", "## Tools", "", "| Tool | Status | Leads | Seconds | Note |", "| --- | --- | --- | --- | --- |"])
     for row in tool_rows:
         note = (row.get("note") or "").replace("|", "/")
-        lines.append(f"| {row['tool']} | {row['status']} | {row['leads']} | {note} |")
+        lines.append(f"| {row['tool']} | {row['status']} | {row['leads']} | {row.get('seconds', '')} | {note} |")
+    missing = [row["tool"] for row in tool_rows if row["status"] != "ok" and row["tool"] in SCANNER_PURPOSE]
+    if missing:
+        lines.extend(["", "Not covered this run:"])
+        for name in missing:
+            lines.append(f"- {name}: {SCANNER_PURPOSE[name]}")
     if truncated:
         lines.extend(["", "## Truncated", ""])
         for tool, count in sorted(truncated.items()):
             lines.append(f"- {tool}: dropped {count} lower-severity leads (cap {PER_TOOL_CAP})")
+    counts = Counter(lead["severity"] for lead in leads)
+    lines.extend(["", "## Lead counts", ""])
+    lines.append(", ".join(f"{name} {counts[name]}" for name in SEVERITY_RANK if counts[name]) or "none")
+    merged = sum(1 for lead in leads if lead.get("also_reported_by"))
+    if merged:
+        lines.append(f"{merged} leads were reported by more than one scanner and are listed once.")
+    if comparison is not None:
+        resolved, unverified = comparison
+        new = sum(1 for lead in leads if lead.get("change") == "new")
+        lines.extend([
+            "",
+            "## Changes since the previous run",
+            "",
+            f"{new} new, {len(leads) - new} unchanged, {len(resolved)} gone. "
+            "A gone lead is not proof of a fix; re-check the finding in source.",
+        ])
+        for lead in resolved[:15]:
+            lines.append(f"- gone: `{lead['tool']}` {lead['file']}:{lead['line']} {lead['rule']}")
+        if unverified:
+            lines.append(f"{len(unverified)} previous leads were not re-checked because their scanner did not run cleanly.")
+    if suppressed:
+        lines.extend(["", "## Accepted in baseline", "", f"{len(suppressed)} leads hidden by the baseline:"])
+        for lead in suppressed[:15]:
+            lines.append(f"- `{lead['tool']}` {lead['file']}:{lead['line']} {lead['rule']} — {lead['accepted_reason']}")
+    if stale:
+        lines.append(f"{len(stale)} baseline entries matched nothing this run; they may be safe to remove.")
     lines.extend(["", "## Top leads", ""])
     if not leads:
         lines.append("No leads.")
     else:
-        for lead in leads[:15]:
-            lines.append(
-                f"- {lead['severity']} `{lead['tool']}` {lead['file']}:{lead['line']} {lead['rule']} — {lead['message']}"
-            )
+        ordered = sorted(leads, key=lambda lead: (0 if lead.get("change") == "new" else 1, SEVERITY_RANK[lead["severity"]]))
+        for lead in ordered[:15]:
+            lines.append(_lead_line(lead))
     lines.append("")
     return "\n".join(lines)
 
 
-def run_preflight(repo_path, out_dir, which_fn=which, runner=run_cmd, cap=PER_TOOL_CAP):
+def run_preflight(repo_path, out_dir, which_fn=which, runner=run_cmd, cap=PER_TOOL_CAP,
+                  baseline_path=None, previous_path=None, cache_dir=None):
     root = assert_safe_repo(repo_path)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    baseline = load_baseline(baseline_path)
+    previous_doc = None
+    if previous_path:
+        previous_doc = json.loads(Path(previous_path).read_text(encoding="utf-8"))
+        if not isinstance(previous_doc, dict):
+            raise ValueError("previous scanner-leads.json is not a preflight document")
     ecosystems = detect_ecosystems(root)
+    size = size_profile(root)
     selected = applicable_scanners(ecosystems)
     tool_home = out / ".tool-home"
-    (tool_home / "cache").mkdir(parents=True, exist_ok=True)
     (tool_home / "config").mkdir(parents=True, exist_ok=True)
-    env = scanner_env(tool_home)
+    env = scanner_env(tool_home, cache=cache_dir or scanner_cache_dir())
     leads = []
     tool_rows = []
-    for name in selected:
-        try:
-            found, note = execute_scanner(name, root, runner, which_fn, env)
-        except Exception as exc:  # noqa: BLE001 — one scanner must not abort the rest
-            found, note = [], clean_message(str(exc)) or "failed"
-        if found:
-            status = "ok"
-        elif note and (
-            "not installed" in note or note.startswith("no ") or "left to osv-scanner" in note
-        ):
-            status = "skipped"
-        elif note:
-            status = "error"
-        else:
-            status = "ok"
-        leads.extend(found)
-        tool_rows.append({"tool": name, "status": status, "leads": len(found), "note": note or ""})
-    leads = dedupe_leads(leads)
+    try:
+        for name in selected:
+            started = time.monotonic()
+            try:
+                found, note = execute_scanner(name, root, runner, which_fn, env)
+            except Exception as exc:  # noqa: BLE001 — one scanner must not abort the rest
+                found, note = [], clean_message(scrub_paths(str(exc), root)) or "failed"
+            note = scrub_paths(note or "", root)
+            if found:
+                status = "ok"
+            elif note and (
+                "not installed" in note or note.startswith("no ") or "left to osv-scanner" in note
+            ):
+                status = "skipped"
+            elif note:
+                status = "error"
+            else:
+                status = "ok"
+            leads.extend(found)
+            tool_rows.append({
+                "tool": name, "status": status, "leads": len(found), "note": note or "",
+                "seconds": round(time.monotonic() - started, 1),
+            })
+    finally:
+        shutil.rmtree(tool_home, ignore_errors=True)
+    leads = merge_cross_tool(dedupe_leads(leads))
+    leads, suppressed, stale = apply_baseline(leads, baseline)
     leads, truncated = cap_leads(leads, cap=cap)
     for row in tool_rows:
         row["leads"] = sum(1 for lead in leads if lead["tool"] == row["tool"])
         if truncated.get(row["tool"]):
             extra = f"capped, dropped {truncated[row['tool']]}"
             row["note"] = "; ".join(part for part in (row["note"], extra) if part)
+    comparison = compare_with_previous(leads, previous_doc, tool_rows) if previous_doc is not None else None
+    public = [public_lead(lead) for lead in leads]
     document = {
         "version": VERSION,
         "target_name": root.name,
         "ecosystems": ecosystems,
+        "size": size,
         "tools": tool_rows,
-        "leads": leads,
+        "leads": public,
         "truncated": truncated,
+        "suppressed": [
+            {**public_lead(lead), "accepted_reason": lead["accepted_reason"], "accepted_at": lead["accepted_at"]}
+            for lead in suppressed
+        ],
+        "baseline_stale": stale,
     }
+    if comparison is not None:
+        document["resolved"], document["not_rechecked"] = comparison
     (out / "scanner-leads.json").write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
-    summary = render_summary(root.name, ecosystems, tool_rows, leads, truncated)
+    summary = render_summary(root.name, ecosystems, tool_rows, public, truncated, size=size,
+                             suppressed=document["suppressed"], stale=stale, comparison=comparison)
     (out / "preflight-summary.md").write_text(summary, encoding="utf-8")
     return document
 
@@ -1745,13 +2021,18 @@ def _metadata_lines(text):
     return text.splitlines()
 
 
+LOCAL_PATH_RE = re.compile(r"(?<![\w.])(?:/home/[A-Za-z0-9._-]+|/Users/[A-Za-z0-9._-]+|/root)(?=/|\b)|[A-Za-z]:\\Users\\[^\\\s]+")
+REPORT_FILES = ("REPORT.md", "FINDINGS-DETAIL.md", "NEEDS-VALIDATION.md")
+
+
 def lint_reports(directory):
     root = Path(directory)
-    files = [root / "REPORT.md", root / "FINDINGS-DETAIL.md"]
-    present = [path for path in files if path.is_file()]
-    problems = []
-    if not present:
+    named = [root / name for name in REPORT_FILES]
+    if not any(path.is_file() for path in named[:2]):
         return ["no REPORT.md or FINDINGS-DETAIL.md"]
+    # Every markdown file the owner may receive, not only the two main reports.
+    present = sorted({path for path in named if path.is_file()} | set(root.glob("*.md")) | set((root / "preflight").glob("*.md")))
+    problems = []
     lead_secrets = []
     lead_files = [root / "scanner-leads.json", root / "preflight" / "scanner-leads.json"]
     for leads_path in lead_files:
@@ -1778,6 +2059,9 @@ def lint_reports(directory):
             continue
         lines = _metadata_lines(text)
         seen = set()
+        for index, line in enumerate(lines, start=1):
+            if LOCAL_PATH_RE.search(line):
+                problems.append(f"{path.name}:{index}: local filesystem path (use repo-relative paths)")
         for secret in lead_secrets:
             if secret and secret in text:
                 line_no = next((index + 1 for index, line in enumerate(lines) if secret in line), 1)
@@ -1815,17 +2099,81 @@ def cmd_report_lint(argv):
     return 0
 
 
+def accept_lead(leads_path, fingerprint, reason, baseline_path):
+    if not reason or len(reason.strip()) < 5:
+        raise ValueError("a reason is required (why the owner accepts this lead)")
+    doc = json.loads(Path(leads_path).read_text(encoding="utf-8"))
+    leads = doc.get("leads") if isinstance(doc, dict) else doc
+    wanted = fingerprint.strip()
+    if not wanted.startswith("sha256:"):
+        wanted = "sha256:" + wanted
+    if len(wanted) < len("sha256:") + 8:
+        raise ValueError("give at least 8 characters of the fingerprint")
+    matches = [lead for lead in leads or [] if isinstance(lead, dict) and str(lead.get("fingerprint", "")).startswith(wanted)]
+    if len(matches) != 1:
+        raise ValueError(f"fingerprint matched {len(matches)} leads; give more characters")
+    lead = matches[0]
+    baseline = load_baseline(baseline_path)
+    key = stable_key(lead)
+    entries = [entry for entry in baseline["entries"] if entry.get("key") != key]
+    entry = {
+        "key": key,
+        "fingerprint": lead["fingerprint"],
+        "tool": lead.get("tool"),
+        "rule": lead.get("rule"),
+        "file": lead.get("file"),
+        "line": lead.get("line"),
+        "kind": lead_kind(lead),
+        "reason": clean_message(reason),
+        "accepted_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    entries.append(entry)
+    baseline["version"] = BASELINE_VERSION
+    baseline["entries"] = entries
+    dest = Path(baseline_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(baseline, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return entry
+
+
+def cmd_accept(argv):
+    parser = argparse.ArgumentParser(prog="sab.py accept")
+    parser.add_argument("leads", help="scanner-leads.json from a preflight run")
+    parser.add_argument("fingerprint", help="lead fingerprint or a unique prefix (8+ hex chars)")
+    parser.add_argument("--reason", required=True)
+    parser.add_argument("--baseline", required=True)
+    args = parser.parse_args(argv)
+    try:
+        entry = accept_lead(args.leads, args.fingerprint, args.reason, args.baseline)
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps(entry, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_preflight(argv, which_fn=which, runner=run_cmd):
     parser = argparse.ArgumentParser(prog="sab.py preflight")
     parser.add_argument("repo_path")
     parser.add_argument("--out", required=True)
+    parser.add_argument("--baseline", default=None, help="accepted-leads file; matching leads are hidden and listed")
+    parser.add_argument("--previous", default=None, help="scanner-leads.json from an earlier run, to mark new and gone leads")
     args = parser.parse_args(argv)
     try:
-        document = run_preflight(args.repo_path, args.out, which_fn=which_fn, runner=runner)
-    except ValueError as exc:
+        document = run_preflight(
+            args.repo_path, args.out, which_fn=which_fn, runner=runner,
+            baseline_path=args.baseline, previous_path=args.previous,
+        )
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    print(f"leads {len(document['leads'])} -> {args.out}")
+    extra = ""
+    if "resolved" in document:
+        new = sum(1 for lead in document["leads"] if lead.get("change") == "new")
+        extra = f" ({new} new, {len(document['resolved'])} gone)"
+    if document["suppressed"]:
+        extra += f", {len(document['suppressed'])} accepted in baseline"
+    print(f"leads {len(document['leads'])}{extra} -> {args.out}")
     return 0
 
 
@@ -1837,6 +2185,13 @@ def build_parser():
     pre = sub.add_parser("preflight")
     pre.add_argument("repo_path")
     pre.add_argument("--out", required=True)
+    pre.add_argument("--baseline", default=None)
+    pre.add_argument("--previous", default=None)
+    acc = sub.add_parser("accept")
+    acc.add_argument("leads")
+    acc.add_argument("fingerprint")
+    acc.add_argument("--reason", required=True)
+    acc.add_argument("--baseline", required=True)
     auth = sub.add_parser("check-authorization")
     auth.add_argument("target")
     auth.add_argument("--affirm", default=None)
@@ -1863,6 +2218,8 @@ def main(argv=None):
         return cmd_check_authorization(rest)
     if cmd == "report-lint":
         return cmd_report_lint(rest)
+    if cmd == "accept":
+        return cmd_accept(rest)
     build_parser().print_help()
     return 2
 
