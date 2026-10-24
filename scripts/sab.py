@@ -1702,6 +1702,12 @@ def run_builtin_checks(root, limit=20000):
         if suffix == ".php":
             leads.extend(check_php(rel, text))
         if suffix in {".yml", ".yaml", ".toml"}:
+            match = re.search(r"(?m)^\s*csrf_protection:\s*false\b", text) if suffix != ".toml" else None
+            if match:
+                leads.append(_check_lead(
+                    "symfony-csrf-disabled", "medium", rel, _line_of(text, match.start()),
+                    "CSRF protection is turned off in the framework config. Forms that change data can be submitted from other sites.",
+                ))
             continue
         client = is_client_file(rel, text, flags)
         if client:
@@ -2940,6 +2946,9 @@ def cmd_setup(which_fn=which, runner=run_cmd):
         rows.append((binary, version, "ok" if status == "ok" else f"skipped: {note}"))
     npm_version = tool_version("npm", which_fn, runner)
     rows.append(("npm", npm_version, "ok" if which_fn("npm") else "skipped: not installed"))
+    # Composer needs PHP, so setup does not install it. Without it, osv-scanner and trivy read composer.lock.
+    composer_version = tool_version("composer", which_fn, runner) if which_fn("composer") else ""
+    rows.append(("composer", composer_version, "ok" if composer_version else "optional: not installed; osv-scanner and trivy read composer.lock"))
     print_table(rows)
     missing = [row[0] for row in rows if row[0] in SCANNER_PURPOSE and row[2] != "ok"]
     if missing:

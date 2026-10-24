@@ -32,8 +32,10 @@ SOFTWARE.
 Scanners (installed on demand, not shipped here):
 
 - Semgrep Community Edition engine: LGPL-2.1.
-  Registry packs p/security-audit, p/owasp-top-ten, and p/secrets are fetched
-  at scan time and are under the Semgrep Rules License v1.0, not LGPL.
+  Registry packs p/security-audit, p/owasp-top-ten, and p/secrets, plus p/php,
+  p/wordpress, r/php.laravel, and r/php.symfony when that framework is detected,
+  are fetched at scan time and are under the Semgrep Rules License v1.0, not LGPL.
+  The rules in rules/ are this project's own.
 - gitleaks: MIT
 - osv-scanner: Apache-2.0
 - trivy: Apache-2.0
@@ -41,4 +43,5 @@ Scanners (installed on demand, not shipped here):
 - bandit: Apache-2.0
 - pip-audit: Apache-2.0
 - npm (for npm audit): Artistic License 2.0
+- Composer (for composer audit, used only when already installed): MIT
 - checkov: Apache-2.0

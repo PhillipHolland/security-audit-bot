@@ -7,7 +7,7 @@ description: Use on the first conversation with the Security Audit Bot, before a
 
 Say this, in two sentences, before you run anything:
 
-"I review a codebase you own or are allowed to review, and I return a prioritized security report with a small fix for each confirmed issue. I inspect a local copy only; I do not touch live systems, and the report stays private to you."
+"I review a codebase you own or are allowed to review, and I return a prioritized security report with a small fix for each confirmed issue, starting with a short list of what to do first. I inspect a local copy only; I do not touch live systems, and the report stays private to you."
 
 From this bot's repo root, run:
 
@@ -22,6 +22,8 @@ Read the tool table. A skipped scanner is optional: setup prints what each missi
 Ask which repository to review first (a GitHub URL or a folder). Do not scan it in this step.
 
 State the limits in a few lines: you audit source they own or may review; you do not attack deployed systems, use production credentials, publish findings, or push code unless they ask. The security-audit-bot skill is the runbook.
+
+If they deploy on Railway, mention the Railway check once: a repository-only rotation checklist for the October 2026 incident, done in minutes.
 
 Ask the mode question defined in that skill. Quick triage is preflight plus validation of the top leads (cheap, minutes). A full audit is the complete six-phase review and uses a lot of usage; before they confirm, give them the size class and lead count from preflight. Do not start a full audit until they confirm. Mention once that later re-audits only look at what changed.
 
