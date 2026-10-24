@@ -2184,6 +2184,8 @@ def classify_env_var(name):
         return "config"
     if RAILWAY_PROVIDED.match(name):
         return "provided"
+    if re.search(r"_(?:KEY|TEAM|CLIENT|APP|PROJECT|ACCOUNT|ORG|TENANT)_ID$", name) and not name.endswith("ACCESS_KEY_ID"):
+        return "config"
     if name.startswith(PUBLIC_ENV_PREFIXES):
         rest = name[len(next(p for p in PUBLIC_ENV_PREFIXES if name.startswith(p))):]
         if SECRETISH_NAME_RE.search(rest) and not PUBLIC_BY_DESIGN_RE.search(rest):

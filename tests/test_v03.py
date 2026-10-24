@@ -352,6 +352,7 @@ class PlatformCheckTests(unittest.TestCase):
             "RAILWAY_PUBLIC_DOMAIN": "provided", "RESEND_API_KEY": "messaging", "WEBHOOK_SIGNING_SALT": "auth",
             "MY_CUSTOM_TOKEN": "other", "PORT": "config", "NEXT_PUBLIC_SITE_NAME": "public",
             "NEXT_PUBLIC_OPENAI_API_KEY": "public-secret", "SUPABASE_SERVICE_ROLE_KEY": "database",
+            "APPLE_KEY_ID": "config", "GOOGLE_CLIENT_ID": "config", "AWS_ACCESS_KEY_ID": "cloud",
         }
         for name, group in cases.items():
             self.assertEqual(sab.classify_env_var(name), group, name)
