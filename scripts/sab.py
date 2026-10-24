@@ -1227,9 +1227,9 @@ def size_profile(root):
 
 
 SIZE_ADVICE = {
-    "small": "A full audit is the lighter end: one recon pass and a few hunters.",
-    "medium": "A full audit is substantial: expect many hunters and a long run.",
-    "large": "A full audit is heavy. Consider scoping to the riskiest directories first, or start with quick triage.",
+    "small": "A full audit at the standard profile stays fairly small.",
+    "medium": "A full audit is a long standard run; a budget or a scoped run keeps it bounded.",
+    "large": "A full audit is heavy; propose a scoped run, or a budget, before a standard run.",
 }
 
 
