@@ -180,7 +180,7 @@ Run this before you send a report:
 python3 scripts/sab.py report-lint <output-dir>
 ```
 
-It checks every markdown file in the run directory and its `preflight/`, including `NEEDS-VALIDATION.md`. It fails on a secret pattern, a high-entropy token, a raw secret from the leads, or a local filesystem path. If it fails, remove the material, use repo-relative paths, and regenerate the prose from `findings.json`. Do not send a report that fails the lint.
+It checks every markdown file in the run directory and its `preflight/`, including `NEEDS-VALIDATION.md`, `PLATFORM-RAILWAY.md`, and `SHARE-LINE.md`. It fails on a secret pattern, a high-entropy token, a raw secret from the leads, or a local filesystem path. If it fails, remove the material, use repo-relative paths, and regenerate the prose from `findings.json`. Do not send a report that fails the lint.
 
 ### What to do first
 
