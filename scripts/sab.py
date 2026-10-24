@@ -489,6 +489,13 @@ def parse_json_output(text):
             return None
 
 
+def local_rule_id(check_id):
+    """Semgrep prefixes local rule ids with the config's directory (host path); keep only 'sab.*'."""
+    rule_id = str(check_id or "")
+    match = re.search(r"(?:^|\.)rules\.(sab\..+)$", rule_id)
+    return match.group(1) if match else rule_id
+
+
 def normalize_semgrep(payload, root):
     results = []
     if isinstance(payload, dict):
@@ -502,18 +509,18 @@ def normalize_semgrep(payload, root):
         extra = item.get("extra") or {}
         start = item.get("start") or {}
         message = extra.get("message") or item.get("check_id") or "semgrep"
-        rule_id = str(item.get("check_id") or "")
+        rule_id = local_rule_id(item.get("check_id"))
         leads.append(
             tag_lead(make_lead(
                 "semgrep",
-                item.get("check_id") or "semgrep",
+                rule_id or "semgrep",
                 extra.get("severity"),
                 relativize(item.get("path"), root),
                 start.get("line") or item.get("line"),
                 message,
                 fingerprint_for(
                     "semgrep",
-                    item.get("check_id"),
+                    rule_id,
                     item.get("path"),
                     start.get("line"),
                     message,
@@ -1601,8 +1608,9 @@ def check_firebase_rules(rel, name, text):
 
 def check_route(rel, text, flags):
     """API and LLM routes with no visible auth check, and LLM routes with no rate limit."""
+    server_action = bool(re.search(r"""^\s*['"]use server['"]""", text[:300], re.M))
     code = _strip_line_comments(text)
-    is_route = bool(ROUTE_PATH_RE.search(rel)) or bool(SERVER_ROUTE_RE.search(code))
+    is_route = server_action or bool(ROUTE_PATH_RE.search(rel)) or bool(SERVER_ROUTE_RE.search(code))
     if not is_route:
         return []
     has_auth = bool(AUTH_HINT_RE.search(code))
@@ -1624,6 +1632,15 @@ def check_route(rel, text, flags):
             )]
         return []
     if has_auth:
+        return []
+    if server_action:
+        match = re.search(r"\bexport\s+(?:async\s+)?function\s+\w+", code)
+        if match:
+            return [_check_lead(
+                "server-action-no-auth", "medium", rel, _line_of(code, match.start()),
+                "Server actions are public POST endpoints, and this file has no visible auth check. "
+                "Check the signed-in user in each action before it reads or changes data.",
+            )]
         return []
     mutating = MUTATING_EXPORT_RE.search(code) or re.search(
         r"\b(?:app|router|server|api|fastify)\.(?:post|put|patch|delete)\s*\(|@(?:app|router|api)\.(?:post|put|patch|delete)\s*\(|methods\s*=\s*\[[^\]]*['\"](?:POST|PUT|PATCH|DELETE)", code

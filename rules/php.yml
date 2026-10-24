@@ -1,0 +1,194 @@
+# Security Audit Bot local rules for PHP. Leads only; validate each one in source.
+rules:
+  - id: sab.php.unserialize-user-input
+    languages: [php]
+    severity: ERROR
+    message: >-
+      unserialize() on request data can build arbitrary objects (PHP object injection).
+      Use json_decode(), or pass ['allowed_classes' => false].
+    patterns:
+      - pattern-either:
+          - pattern: unserialize(<... $_GET ...>, ...)
+          - pattern: unserialize(<... $_POST ...>, ...)
+          - pattern: unserialize(<... $_REQUEST ...>, ...)
+          - pattern: unserialize(<... $_COOKIE ...>, ...)
+          - pattern: unserialize(<... $_SERVER ...>, ...)
+          - pattern: unserialize(<... file_get_contents('php://input') ...>, ...)
+      - pattern-not: unserialize($X, ['allowed_classes' => false])
+    metadata: {category: security, cwe: "CWE-502"}
+
+  - id: sab.php.eval-user-input
+    languages: [php]
+    severity: ERROR
+    message: eval(), assert() with a string, or create_function() on request data runs attacker code. Remove it.
+    pattern-either:
+      - pattern: eval(<... $_GET ...>)
+      - pattern: eval(<... $_POST ...>)
+      - pattern: eval(<... $_REQUEST ...>)
+      - pattern: eval(<... $_COOKIE ...>)
+      - pattern: assert(<... $_GET ...>)
+      - pattern: assert(<... $_POST ...>)
+      - pattern: assert(<... $_REQUEST ...>)
+      - pattern: create_function(...)
+    metadata: {category: security, cwe: "CWE-95"}
+
+  - id: sab.php.include-user-path
+    languages: [php]
+    severity: ERROR
+    message: >-
+      include/require with a path from the request allows local (or remote) file inclusion.
+      Map the input to a fixed allowlist of files.
+    pattern-either:
+      - pattern: include <... $_GET ...>;
+      - pattern: include <... $_POST ...>;
+      - pattern: include <... $_REQUEST ...>;
+      - pattern: include <... $_COOKIE ...>;
+      - pattern: include_once <... $_GET ...>;
+      - pattern: include_once <... $_POST ...>;
+      - pattern: include_once <... $_REQUEST ...>;
+      - pattern: require <... $_GET ...>;
+      - pattern: require <... $_POST ...>;
+      - pattern: require <... $_REQUEST ...>;
+      - pattern: require_once <... $_GET ...>;
+      - pattern: require_once <... $_POST ...>;
+      - pattern: require_once <... $_REQUEST ...>;
+    metadata: {category: security, cwe: "CWE-98"}
+
+  - id: sab.php.sql-string-concat
+    languages: [php]
+    severity: WARNING
+    message: >-
+      SQL built by joining strings with a variable. If the variable comes from a user, this is SQL injection.
+      Use a prepared statement with bound parameters ($wpdb->prepare, PDO::prepare, query builder bindings).
+    patterns:
+      - pattern-either:
+          - pattern: mysqli_query($C, <... "..." . $X ...>)
+          - pattern: mysql_query(<... "..." . $X ...>)
+          - pattern: $DB->query(<... "..." . $X ...>, ...)
+          - pattern: $DB->exec(<... "..." . $X ...>)
+          - pattern: $DB->get_results(<... "..." . $X ...>, ...)
+          - pattern: $DB->get_row(<... "..." . $X ...>, ...)
+          - pattern: $DB->get_var(<... "..." . $X ...>, ...)
+          - pattern: $DB->get_col(<... "..." . $X ...>, ...)
+          - pattern: DB::raw(<... "..." . $X ...>)
+          - pattern: DB::select(<... "..." . $X ...>, ...)
+          - pattern: DB::statement(<... "..." . $X ...>, ...)
+          - pattern: $Q->whereRaw(<... "..." . $X ...>, ...)
+          - pattern: $Q->orderByRaw(<... "..." . $X ...>, ...)
+          - pattern: $Q->selectRaw(<... "..." . $X ...>, ...)
+      - pattern-not: $DB->$M($DB->prepare(...), ...)
+      - metavariable-regex:
+          metavariable: $X
+          regex: ^(?!\s*(?:intval|absint|\(int\)|\(float\)|esc_sql|\$wpdb->prepare|\$this->db->escape|\$[A-Za-z_]*->quote|"|')).*
+    metadata: {category: security, cwe: "CWE-89"}
+
+  - id: sab.php.sql-request-data
+    languages: [php]
+    severity: ERROR
+    message: >-
+      Request data goes straight into a SQL query. This is SQL injection unless the value is cast or bound.
+      Use a prepared statement ($wpdb->prepare, PDO::prepare, query builder bindings).
+    patterns:
+      - pattern-either:
+          - pattern: $DB->$M(<... $_GET ...>, ...)
+          - pattern: $DB->$M(<... $_POST ...>, ...)
+          - pattern: $DB->$M(<... $_REQUEST ...>, ...)
+          - pattern: $DB->$M(<... $_COOKIE ...>, ...)
+          - pattern: mysqli_query($C, <... $_GET ...>)
+          - pattern: mysqli_query($C, <... $_POST ...>)
+          - pattern: mysqli_query($C, <... $_REQUEST ...>)
+      - metavariable-regex:
+          metavariable: $M
+          regex: ^(query|exec|get_results|get_row|get_var|get_col|unprepared|statement|select|whereRaw|selectRaw|orderByRaw|havingRaw)$
+      - pattern-not: $DB->$M(<... $DB->prepare(...) ...>, ...)
+      - pattern-not: $DB->$M(<... intval(...) ...>, ...)
+      - pattern-not: $DB->$M(<... absint(...) ...>, ...)
+    metadata: {category: security, cwe: "CWE-89"}
+
+  - id: sab.php.laravel-csrf-except-all
+    languages: [php]
+    severity: WARNING
+    message: CSRF protection is switched off for every route. Remove '*' and list only webhook paths that verify a signature.
+    pattern-either:
+      - pattern: |
+          class $C extends $P { ... protected $except = [..., '*', ...]; ... }
+      - pattern: |
+          $M->validateCsrfTokens(except: [..., '*', ...])
+    metadata: {category: security, cwe: "CWE-352"}
+
+  - id: sab.php.wp-is-admin-as-auth
+    languages: [php]
+    severity: WARNING
+    message: >-
+      is_admin() is true for any request to wp-admin, including admin-ajax.php from a logged-out user.
+      It is not a permission check. Use current_user_can() with the right capability.
+    pattern-either:
+      - pattern: if (<... is_admin() ...>) { ... }
+    metadata: {category: security, cwe: "CWE-285"}
+
+  - id: sab.php.wp-nonce-result-ignored
+    languages: [php]
+    severity: WARNING
+    message: The nonce check result is ignored, so the request goes ahead even with a bad nonce. Check the return value and stop.
+    pattern-either:
+      - pattern: wp_verify_nonce(...);
+      - pattern: check_ajax_referer($A, $B, false);
+    metadata: {category: security, cwe: "CWE-352"}
+
+  - id: sab.php.wp-nopriv-ajax
+    languages: [php]
+    severity: INFO
+    message: >-
+      This AJAX action runs for logged-out visitors. Confirm the handler checks a nonce and changes nothing
+      a visitor should not change.
+    patterns:
+      - pattern: add_action("$HOOK", ...)
+      - metavariable-regex:
+          metavariable: $HOOK
+          regex: ^wp_ajax_nopriv_
+    metadata: {category: security, cwe: "CWE-862"}
+
+  - id: sab.php.wp-ajax-no-capability
+    languages: [php]
+    severity: WARNING
+    message: >-
+      This AJAX or REST handler changes data without a capability check. Add current_user_can() and a nonce check
+      (check_ajax_referer) before acting.
+    patterns:
+      - pattern-either:
+          - pattern: |
+              function $F(...) { ... update_option(...); ... }
+          - pattern: |
+              function $F(...) { ... delete_option(...); ... }
+          - pattern: |
+              function $F(...) { ... wp_delete_post(...); ... }
+          - pattern: |
+              function $F(...) { ... wp_insert_user(...); ... }
+          - pattern: |
+              function $F(...) { ... wp_update_user(...); ... }
+          - pattern: |
+              function $F(...) { ... update_user_meta(...); ... }
+          - pattern: |
+              function $F(...) { ... $WPDB->query(...); ... }
+      - pattern-not: |
+          function $F(...) { ... current_user_can(...); ... }
+      - pattern-not: |
+          function $F(...) { ... if (<... current_user_can(...) ...>) { ... } ... }
+      - pattern-not: |
+          function $F(...) { ... if (<... current_user_can(...) ...>) ...; ... }
+      - pattern-inside: |
+          add_action("=~/^wp_ajax_/", ...);
+          ...
+      - focus-metavariable: $F
+    metadata: {category: security, cwe: "CWE-862"}
+
+  - id: sab.php.wp-rest-open-permission
+    languages: [php]
+    severity: WARNING
+    message: This REST route lets anyone call it (permission_callback returns true). Check a capability unless the route is meant to be public and read-only.
+    pattern-either:
+      - pattern: |
+          register_rest_route($NS, $R, [..., 'permission_callback' => '__return_true', ...])
+      - pattern: |
+          register_rest_route($NS, $R, array(..., 'permission_callback' => '__return_true', ...))
+    metadata: {category: security, cwe: "CWE-862"}

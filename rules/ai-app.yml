@@ -1,0 +1,90 @@
+# Security Audit Bot local rules for apps built with AI tools. Leads only; validate each one in source.
+rules:
+  - id: sab.js.llm-client-in-browser
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      dangerouslyAllowBrowser sends your AI provider key to every visitor's browser. Anyone can copy it and spend your credits.
+      Call the provider from a server route that checks the user.
+    pattern-either:
+      - pattern: |
+          new $C({..., dangerouslyAllowBrowser: true, ...})
+      - pattern: |
+          $C({..., dangerouslyAllowBrowser: true, ...})
+    metadata: {category: security, cwe: "CWE-522"}
+
+  - id: sab.js.cors-any-origin-with-credentials
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      CORS allows any origin and sends credentials. Any website can make logged-in requests as your users.
+      List the exact origins you trust.
+    pattern-either:
+      - pattern: |
+          cors({..., origin: true, ..., credentials: true, ...})
+      - pattern: |
+          cors({..., credentials: true, ..., origin: true, ...})
+      - pattern: |
+          cors({..., origin: "*", ..., credentials: true, ...})
+      - pattern: |
+          cors({..., credentials: true, ..., origin: "*", ...})
+      - pattern: |
+          cors({..., origin: (...) => true, ..., credentials: true, ...})
+      - pattern: |
+          cors({..., origin: ($O, $CB) => $CB(null, true), ..., credentials: true, ...})
+    metadata: {category: security, cwe: "CWE-942"}
+
+  - id: sab.js.cors-reflect-origin
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      The request's Origin header is copied into Access-Control-Allow-Origin. With credentials, any site can read
+      your users' data. Compare the origin against an allowlist first.
+    pattern-either:
+      - pattern: $RES.setHeader("Access-Control-Allow-Origin", $REQ.headers.origin)
+      - pattern: $RES.header("Access-Control-Allow-Origin", $REQ.headers.origin)
+      - pattern: $RES.set("Access-Control-Allow-Origin", $REQ.headers.origin)
+      - pattern: $H.set("Access-Control-Allow-Origin", $REQ.headers.get("origin"))
+      - pattern: $RES.setHeader("Access-Control-Allow-Origin", $REQ.get("origin"))
+    metadata: {category: security, cwe: "CWE-942"}
+
+  - id: sab.py.cors-any-origin-with-credentials
+    languages: [python]
+    severity: WARNING
+    message: >-
+      CORS allows any origin with credentials. Any website can make logged-in requests as your users.
+      List the exact origins you trust.
+    pattern-either:
+      - pattern: $APP.add_middleware(CORSMiddleware, ..., allow_origins=["*"], ..., allow_credentials=True, ...)
+      - pattern: $APP.add_middleware(CORSMiddleware, ..., allow_credentials=True, ..., allow_origins=["*"], ...)
+      - pattern: $APP.add_middleware(CORSMiddleware, ..., allow_origin_regex=".*", ..., allow_credentials=True, ...)
+      - pattern: CORS($APP, ..., supports_credentials=True, ...)
+    metadata: {category: security, cwe: "CWE-942"}
+
+  - id: sab.js.supabase-service-role-public-env
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      A Supabase client is created with a service_role key from a public env var. That key bypasses row level
+      security and ships to the browser. Use the anon key in the client; keep service_role on the server.
+    patterns:
+      - pattern-either:
+          - pattern: createClient($URL, process.env.$KEY, ...)
+          - pattern: createClient($URL, import.meta.env.$KEY, ...)
+      - metavariable-regex:
+          metavariable: $KEY
+          regex: ^(NEXT_PUBLIC_|VITE_|EXPO_PUBLIC_|REACT_APP_|PUBLIC_|NUXT_PUBLIC_).*(SERVICE_ROLE|SECRET)
+    metadata: {category: security, cwe: "CWE-200"}
+
+  - id: sab.js.jwt-decode-as-auth
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      jwt.decode() reads a token without checking its signature, so anyone can forge one. Use jwt.verify()
+      (or your auth library's verify) before trusting the claims.
+    patterns:
+      - pattern: $JWT.decode($TOKEN, ...)
+      - metavariable-regex:
+          metavariable: $JWT
+          regex: ^(jwt|jsonwebtoken|JWT)$
+    metadata: {category: security, cwe: "CWE-347"}
