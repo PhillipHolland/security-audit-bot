@@ -22,7 +22,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SKILL_REPO = "https://github.com/cloudflare/security-audit-skill"
 SKILL_COMMIT = "c1c8a8c1471069fb0e188eeaff69b8e8db6564a8"
 PER_TOOL_CAP = 100
@@ -131,6 +131,19 @@ HEX_RE = re.compile(r"^[0-9a-fA-F]{32,64}$")
 CHECKSUM_RE = re.compile(r"^([a-fA-F0-9]{64})\s+\*?(\S+)$")
 AFFIRM_MARKERS = ("this is my code", "i have permission")
 
+# What the audit loses when a scanner is missing. Printed by setup and preflight.
+SCANNER_PURPOSE = {
+    "semgrep": "code-pattern leads (injection, unsafe APIs) for most languages",
+    "gitleaks": "hard-coded secret leads in files and git history",
+    "osv-scanner": "known-vulnerable dependency leads from lockfiles",
+    "trivy": "dependency, misconfiguration, and secret leads",
+    "zizmor": "GitHub Actions workflow leads",
+    "bandit": "Python code-pattern leads",
+    "npm-audit": "npm dependency leads from package-lock.json",
+    "pip-audit": "Python dependency leads from requirements files",
+    "checkov": "Terraform and Kubernetes misconfiguration leads",
+}
+
 
 def data_dir():
     return Path.home() / ".local" / "share" / "security-audit-bot"
@@ -144,10 +157,21 @@ def bindir():
     return Path.home() / ".local" / "bin"
 
 
+def venv_root():
+    return data_dir() / "venvs"
+
+
+def scanner_cache_dir():
+    return data_dir() / "scanner-cache"
+
+
 def which(name):
     local = bindir() / name
     if local.is_file() and os.access(local, os.X_OK):
         return str(local)
+    for candidate in sorted(venv_root().glob(f"*/bin/{name}")):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
     return shutil.which(name)
 
 
@@ -1334,19 +1358,45 @@ def _pip_install(package, runner):
     return True, "installed with pip --user"
 
 
+def _venv_install(package, binary, runner):
+    # One private venv per tool. Works on PEP 668 hosts where pip --user is blocked.
+    root = venv_root() / package
+    python = root / "bin" / "python"
+    if not python.exists():
+        made = runner([sys.executable, "-m", "venv", str(root)], timeout=180, cwd=None, env=os.environ.copy())
+        if made.returncode != 0:
+            return False, "could not create a venv: " + (_note_from_result(made) or "python3 -m venv failed")
+    argv = [str(python), "-m", "pip", "install", "--quiet", "--disable-pip-version-check", package]
+    result = runner(argv, timeout=900, cwd=None, env=os.environ.copy())
+    if result.returncode != 0:
+        return False, "venv pip install failed: " + (_note_from_result(result) or f"exit {result.returncode}")
+    exe = root / "bin" / binary
+    if not exe.exists():
+        return False, f"{binary} missing after venv install"
+    link = bindir() / binary
+    if not link.exists() and not link.is_symlink():
+        try:
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(exe)
+        except OSError:
+            pass
+    return True, "installed in a private venv"
+
+
 def install_python_tool(package, binary, runner, which_fn, prefer_pipx=False):
     if which_fn(binary):
         return "ok", "already installed"
     if prefer_pipx and which_fn("pipx"):
-        result = runner(["pipx", "install", package], timeout=300, cwd=None, env=os.environ.copy())
+        result = runner(["pipx", "install", package], timeout=600, cwd=None, env=os.environ.copy())
         if result.returncode == 0 and which_fn(binary):
             return "ok", "installed with pipx"
-    ok, note = _pip_install(package, runner)
+    ok, pip_note = _pip_install(package, runner)
+    if ok and which_fn(binary):
+        return "ok", pip_note
+    ok, note = _venv_install(package, binary, runner)
     if ok and which_fn(binary):
         return "ok", note
-    if ok:
-        return "skipped", f"installed package {package} but {binary} is not on PATH"
-    return "skipped", note
+    return "skipped", note if pip_note in note else f"{note} (pip --user: {pip_note})"
 
 
 def _git(dest, args, runner):
@@ -1354,11 +1404,37 @@ def _git(dest, args, runner):
     return runner(argv, timeout=180, cwd=str(dest), env=os.environ.copy())
 
 
+def _readable_git_dir(dest, runner):
+    probe = _git(dest, ["rev-parse", "--absolute-git-dir"], runner)
+    if probe.returncode != 0:
+        return False
+    got = (probe.stdout or "").strip()
+    try:
+        return Path(got).resolve() == (dest / ".git").resolve()
+    except OSError:
+        return False
+
+
+def _config_names_pin(dest):
+    try:
+        text = (dest / ".git" / "config").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return SKILL_REPO in text
+
+
 def install_skill(runner=run_cmd):
     dest = skill_clone_dir()
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and any(dest.iterdir()) and not (dest / ".git").exists():
-        return "skipped", "skill path exists and is not the pinned clone"
+        return "skipped", f"{dest} exists but is not a git clone; move it aside and rerun setup"
+    if dest.exists() and (dest / ".git").exists() and not _readable_git_dir(dest, runner):
+        # A copied or interrupted clone (e.g. .git/objects missing). Keep it, move it aside, refetch.
+        if not _config_names_pin(dest):
+            return "skipped", f"{dest} has an unreadable .git that is not the pinned skill; move it aside and rerun setup"
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        aside = dest.with_name(f"{dest.name}.damaged-{stamp}")
+        dest.rename(aside)
     if not dest.exists():
         dest.mkdir(parents=True)
         init = _git(dest, ["init"], runner)
@@ -1370,8 +1446,10 @@ def install_skill(runner=run_cmd):
     else:
         remote = _git(dest, ["remote", "get-url", "origin"], runner)
         url = (remote.stdout or "").strip()
-        if remote.returncode != 0 or SKILL_REPO not in url:
-            return "skipped", "skill path is a different git remote; refusing to replace it"
+        if remote.returncode != 0:
+            return "skipped", f"{dest} has no origin remote; move it aside and rerun setup"
+        if SKILL_REPO not in url:
+            return "skipped", f"{dest} points at a different remote; refusing to replace it"
     head = _git(dest, ["rev-parse", "HEAD"], runner)
     if head.returncode == 0 and (head.stdout or "").strip() == SKILL_COMMIT:
         skill_md = dest / "skills" / "security-audit" / "SKILL.md"
@@ -1454,6 +1532,13 @@ def cmd_setup(which_fn=which, runner=run_cmd):
     npm_version = tool_version("npm", which_fn, runner)
     rows.append(("npm", npm_version, "ok" if which_fn("npm") else "skipped: not installed"))
     print_table(rows)
+    missing = [row[0] for row in rows if row[0] in SCANNER_PURPOSE and row[2] != "ok"]
+    if missing:
+        print("\nMissing scanners. Preflight still runs; these leads will be absent:")
+        for name in missing:
+            print(f"- {name}: {SCANNER_PURPOSE[name]}")
+    if skill_status != "ok":
+        print("\nThe pinned Cloudflare skill is not ready. Do not start an audit until setup reports it ok.")
     local = str(bindir())
     if local not in os.environ.get("PATH", "").split(os.pathsep):
         print(f"\n{local} is not on PATH. sab.py still looks there; shells need it for direct use.")
